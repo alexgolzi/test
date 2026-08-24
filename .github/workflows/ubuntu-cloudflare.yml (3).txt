@@ -1,0 +1,261 @@
+name: Ubuntu Test Runner (Cloudflare Tunnel)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  test-runner:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350   # حداکثر واقعی گیت‌هاب ۳۶۰ دقیقه (۶ ساعت) است
+
+    env:
+      CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CF_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+      TUNNEL_NAME: ${{ secrets.TUNNEL_NAME }}
+      TUNNEL_HOSTNAME: ${{ secrets.TUNNEL_HOSTNAME }}
+      # اگر اسم این فایل را عوض کردی، این مقدار را هم عوض کن
+      WORKFLOW_FILE: ubuntu-cloudflare.yml
+      # چند دقیقه قبل از پایان مهلت، Runner بعدی trigger شود
+      # TODO(handoff): این متغیر فعلاً در هیچ Step ای استفاده نمی‌شود.
+      # یعنی وقتی JOB_BUDGET_MINUTES تمام شود، این Runner بدون جایگزین می‌میرد
+      # و سرویس قطع می‌شود. باید یک Step قبل از "Keep runner alive" اضافه شود
+      # که با GitHub API خودش را دوباره workflow_dispatch کند (نیاز به permission: actions: write که از قبل داریم).
+      HANDOFF_MARGIN_MINUTES: 15
+      # کل مهلت واقعی Job (کمی کمتر از timeout-minutes برای فضای امن)
+      # TODO(handoff): همین‌طور بی‌استفاده - فعلاً فقط JOB_BUDGET_MINUTES در env است.
+      JOB_BUDGET_MINUTES: 340
+
+    steps:
+      - name: Install jq, sqlite3 and cloudflared
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq sqlite3
+          curl -Ls https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Enable root login with password
+        env:
+          ROOT_PASS: ${{ secrets.ROOT_PASSWORD }}
+        run: |
+          if [ -z "$ROOT_PASS" ]; then
+            echo "::error::ROOT_PASSWORD secret تنظیم نشده است."
+            exit 1
+          fi
+          echo "root:${ROOT_PASS}" | sudo chpasswd
+          sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo systemctl enable ssh
+          sudo systemctl restart ssh
+          echo "Root password set from secret (not printed)."
+
+      - name: Install 3x-ui panel
+        run: |
+          sudo bash -c "bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) v3.6.0"
+
+      - name: Detect panel port
+        id: panel
+        run: |
+          # روش اصلی: استفاده از دستور رسمی x-ui که مستقل از نسخه دیتابیس کار می‌کند
+          PORT=$(sudo x-ui setting -show true 2>/dev/null | grep -i "port" | grep -oE '[0-9]+' | head -n1)
+
+          # روش پشتیبان: خواندن مستقیم از sqlite در صورت شکست روش بالا
+          if [ -z "$PORT" ]; then
+            echo "روش x-ui setting جواب نداد، تلاش با sqlite..."
+            PORT=$(sudo sqlite3 /etc/x-ui/x-ui.db "SELECT value FROM settings WHERE key='webPort';" 2>/dev/null)
+          fi
+
+          if [ -z "$PORT" ]; then
+            echo "::error::پورت پنل پیدا نشد. لاگ نصب 3x-ui را بررسی کن."
+            exit 1
+          fi
+
+          echo "port=$PORT" >> "$GITHUB_OUTPUT"
+          echo "Detected panel port: $PORT"
+
+      - name: Get or create Cloudflare Tunnel
+        id: tunnel
+        run: |
+          set -e
+
+          check_success () {
+            local resp="$1"
+            local step_name="$2"
+            local ok
+            ok=$(echo "$resp" | jq -r '.success')
+            if [ "$ok" != "true" ]; then
+              echo "::error::درخواست Cloudflare ($step_name) شکست خورد."
+              echo "$resp" | jq -r '.errors'
+              exit 1
+            fi
+          }
+
+          EXISTING=$(curl -s -X GET \
+            "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/cfd_tunnel?name=${TUNNEL_NAME}&is_deleted=false" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json")
+          check_success "$EXISTING" "list tunnels"
+
+          TUNNEL_ID=$(echo "$EXISTING" | jq -r '.result[0].id // empty')
+
+          if [ -z "$TUNNEL_ID" ]; then
+            echo "No existing tunnel found, creating a new one..."
+            CREATE=$(curl -s -X POST \
+              "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/cfd_tunnel" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "{\"name\":\"${TUNNEL_NAME}\",\"config_src\":\"cloudflare\"}")
+            check_success "$CREATE" "create tunnel"
+            TUNNEL_ID=$(echo "$CREATE" | jq -r '.result.id')
+            echo "Created tunnel: $TUNNEL_ID"
+          else
+            echo "Reusing existing tunnel: $TUNNEL_ID"
+          fi
+
+          if [ -z "$TUNNEL_ID" ] || [ "$TUNNEL_ID" = "null" ]; then
+            echo "::error::TUNNEL_ID خالی ماند، ادامه معنی ندارد."
+            exit 1
+          fi
+
+          echo "tunnel_id=$TUNNEL_ID" >> "$GITHUB_OUTPUT"
+
+          # گرفتن Token اتصال برای این تونل
+          TOKEN_RESP=$(curl -s -X GET \
+            "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${TUNNEL_ID}/token" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}")
+          check_success "$TOKEN_RESP" "get connector token"
+
+          CONNECTOR_TOKEN=$(echo "$TOKEN_RESP" | jq -r '.result')
+          if [ -z "$CONNECTOR_TOKEN" ] || [ "$CONNECTOR_TOKEN" = "null" ]; then
+            echo "::error::Connector token خالی برگشت."
+            exit 1
+          fi
+          echo "::add-mask::$CONNECTOR_TOKEN"
+          echo "connector_token=$CONNECTOR_TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Configure Tunnel ingress (route hostname -> localhost panel port)
+        run: |
+          RESP=$(curl -s -X PUT \
+            "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${{ steps.tunnel.outputs.tunnel_id }}/configurations" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "{
+              \"config\": {
+                \"ingress\": [
+                  { \"hostname\": \"${TUNNEL_HOSTNAME}\", \"service\": \"http://localhost:${{ steps.panel.outputs.port }}\" },
+                  { \"service\": \"http_status:404\" }
+                ]
+              }
+            }")
+          OK=$(echo "$RESP" | jq -r '.success')
+          if [ "$OK" != "true" ]; then
+            echo "::error::تنظیم ingress شکست خورد."
+            echo "$RESP" | jq -r '.errors'
+            exit 1
+          fi
+          echo "Ingress configured: ${TUNNEL_HOSTNAME} -> localhost:${{ steps.panel.outputs.port }}"
+
+      - name: Create/Update DNS record for tunnel hostname
+        run: |
+          TUNNEL_ID="${{ steps.tunnel.outputs.tunnel_id }}"
+          TARGET="${TUNNEL_ID}.cfargotunnel.com"
+
+          EXISTING_DNS=$(curl -s -X GET \
+            "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=${TUNNEL_HOSTNAME}" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}")
+          OK=$(echo "$EXISTING_DNS" | jq -r '.success')
+          if [ "$OK" != "true" ]; then
+            echo "::error::خواندن رکورد DNS شکست خورد."
+            echo "$EXISTING_DNS" | jq -r '.errors'
+            exit 1
+          fi
+
+          RECORD_ID=$(echo "$EXISTING_DNS" | jq -r '.result[0].id // empty')
+
+          if [ -z "$RECORD_ID" ]; then
+            RESP=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "{\"type\":\"CNAME\",\"name\":\"${TUNNEL_HOSTNAME}\",\"content\":\"${TARGET}\",\"proxied\":true}")
+            ACTION="create"
+          else
+            RESP=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${RECORD_ID}" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "{\"type\":\"CNAME\",\"name\":\"${TUNNEL_HOSTNAME}\",\"content\":\"${TARGET}\",\"proxied\":true}")
+            ACTION="update"
+          fi
+
+          OK=$(echo "$RESP" | jq -r '.success')
+          if [ "$OK" != "true" ]; then
+            echo "::error::$ACTION رکورد DNS شکست خورد."
+            echo "$RESP" | jq -r '.errors'
+            exit 1
+          fi
+          echo "DNS record $ACTION موفق بود -> $TARGET"
+
+      - name: Test local panel before starting tunnel
+        run: |
+          PORT="${{ steps.panel.outputs.port }}"
+          echo "Testing http://127.0.0.1:${PORT} ..."
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://127.0.0.1:${PORT}" || echo "000")
+          echo "Local panel responded with HTTP ${CODE}"
+          if [ "$CODE" = "000" ]; then
+            echo "::error::پنل روی localhost:${PORT} اصلاً پاسخ نداد (connection refused/timeout). مشکل از Sanaei است، نه Tunnel."
+            sudo systemctl status x-ui --no-pager || true
+            exit 1
+          fi
+
+      - name: Run cloudflared connector
+        run: |
+          echo "Panel will be reachable at: https://${TUNNEL_HOSTNAME}"
+
+          nohup cloudflared tunnel run \
+            --token "${{ steps.tunnel.outputs.connector_token }}" \
+            > /tmp/cloudflared.log 2>&1 &
+          disown
+
+          echo "Waiting for tunnel connection..."
+          CONNECTED=0
+          for i in $(seq 1 30); do
+            if grep -q "Registered tunnel connection" /tmp/cloudflared.log; then
+              echo "Tunnel connected successfully after ${i}0s (approx)."
+              CONNECTED=1
+              break
+            fi
+            sleep 2
+          done
+
+          echo "--- cloudflared log ---"
+          cat /tmp/cloudflared.log
+          echo "-----------------------"
+
+          if [ "$CONNECTED" != "1" ]; then
+            echo "::error::Tunnel did not establish a connection within 60 seconds. مراحل بعدی متوقف شدند."
+            exit 1
+          fi
+
+          # تست واقعی از طریق hostname عمومی (نه فقط localhost)
+          echo "Testing https://${TUNNEL_HOSTNAME} from the runner itself..."
+          for i in $(seq 1 10); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "https://${TUNNEL_HOSTNAME}" || echo "000")
+            if [ "$CODE" != "000" ]; then
+              echo "Public hostname responded with HTTP ${CODE}"
+              break
+            fi
+            echo "هنوز DNS/routing آماده نیست (تلاش ${i}/10)، صبر..."
+            sleep 3
+          done
+
+      - name: Keep runner alive
+        run: |
+          echo "Panel URL: https://${TUNNEL_HOSTNAME}"
+          echo "SSH root password set from ROOT_PASSWORD secret (not printed here)."
+          echo "توجه: SSH فعلاً از این مسیر عمومی نشده — این تونل فقط پنل HTTP را expose می‌کند."
+          sleep 20000
