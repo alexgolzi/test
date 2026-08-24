@@ -36,7 +36,7 @@ jobs:
 
       - name: Install 3x-ui panel
         run: |
-          bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) v3.6.0
+          sudo bash -c "bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) v3.6.0"
 
       - name: Keep runner alive
         run: |
