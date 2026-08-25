@@ -1,0 +1,543 @@
+name: Ubuntu Test Runner (Cloudflare Tunnel)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  test-runner:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350   # حداکثر واقعی گیت‌هاب ۳۶۰ دقیقه (۶ ساعت) است
+
+    env:
+      CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CF_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+      TUNNEL_NAME: ${{ secrets.TUNNEL_NAME }}
+      TUNNEL_HOSTNAME: ${{ secrets.TUNNEL_HOSTNAME }}
+      # اختیاری: hostname دوم برای VLESS+WS (مثلاً vpn.domain.com).
+      # اگر خالی باشد، ingress فقط همان رفتار قبلی (فقط پنل) را دارد.
+      TUNNEL_HOSTNAME_VPN: ${{ secrets.TUNNEL_HOSTNAME_VPN }}
+      # اختیاری: hostname سوم برای SSH از طریق Tunnel (مثلاً ssh.domain.com).
+      # چون GitHub Actions هیچ اتصال ورودی مستقیم به IP Runner را قبول نمی‌کند
+      # (این محدودیت در سطح فایروال شبکه‌ی Azure است، نه چیزی که x-ui/sshd کنترل کند)،
+      # تنها راه واقعی برای SSH، عبور از همین Tunnel است، نه اتصال به IP.
+      TUNNEL_HOSTNAME_SSH: ${{ secrets.TUNNEL_HOSTNAME_SSH }}
+      # پورت داخلی Inbound مخصوص Tunnel (VLESS + WS) که خودت دستی در پنل ساختی.
+      # این پورت هرگز مستقیماً از اینترنت باز نمی‌شود؛ فقط از طریق Tunnel به آن می‌رسیم.
+      XRAY_WS_PORT: 10000
+      # اگر اسم این فایل را عوض کردی، این مقدار را هم عوض کن
+      WORKFLOW_FILE: ubuntu-cloudflare.yml
+      # چند دقیقه قبل از پایان مهلت، Runner بعدی trigger شود
+      # پیاده‌سازی در step "Keep runner alive": وقتی SECONDS به
+      # (JOB_BUDGET_MINUTES - HANDOFF_MARGIN_MINUTES) دقیقه برسد، این Runner با
+      # GitHub API خودش را دوباره workflow_dispatch می‌کند (نیاز به permission:
+      # actions: write که از قبل داریم، و secrets.GITHUB_TOKEN که پیش‌فرض GitHub است).
+      HANDOFF_MARGIN_MINUTES: 15
+      # کل مهلت واقعی Job (کمی کمتر از timeout-minutes برای فضای امن)
+      JOB_BUDGET_MINUTES: 340
+
+    steps:
+      - name: Install jq, sqlite3 and cloudflared
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq sqlite3
+          curl -Ls https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Enable root login with password
+        env:
+          ROOT_PASS: ${{ secrets.ROOT_PASSWORD }}
+        run: |
+          if [ -z "$ROOT_PASS" ]; then
+            echo "::error::ROOT_PASSWORD secret تنظیم نشده است."
+            exit 1
+          fi
+          echo "root:${ROOT_PASS}" | sudo chpasswd
+          sudo sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo systemctl enable ssh
+          sudo systemctl restart ssh
+          echo "Root password set from secret (not printed)."
+
+      - name: Install 3x-ui panel
+        run: |
+          sudo bash -c "bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) v3.6.0"
+
+      - name: Detect panel port
+        id: panel
+        run: |
+          # روش اصلی: استفاده از دستور رسمی x-ui که مستقل از نسخه دیتابیس کار می‌کند
+          PORT=$(sudo x-ui setting -show true 2>/dev/null | grep -i "port" | grep -oE '[0-9]+' | head -n1)
+
+          # روش پشتیبان: خواندن مستقیم از sqlite در صورت شکست روش بالا
+          if [ -z "$PORT" ]; then
+            echo "روش x-ui setting جواب نداد، تلاش با sqlite..."
+            PORT=$(sudo sqlite3 /etc/x-ui/x-ui.db "SELECT value FROM settings WHERE key='webPort';" 2>/dev/null)
+          fi
+
+          if [ -z "$PORT" ]; then
+            echo "::error::پورت پنل پیدا نشد. لاگ نصب 3x-ui را بررسی کن."
+            exit 1
+          fi
+
+          echo "port=$PORT" >> "$GITHUB_OUTPUT"
+          echo "Detected panel port: $PORT"
+
+      - name: Get or create Cloudflare Tunnel
+        id: tunnel
+        run: |
+          set -e
+
+          check_success () {
+            local resp="$1"
+            local step_name="$2"
+            local ok
+            ok=$(echo "$resp" | jq -r '.success')
+            if [ "$ok" != "true" ]; then
+              echo "::error::درخواست Cloudflare ($step_name) شکست خورد."
+              echo "$resp" | jq -r '.errors'
+              exit 1
+            fi
+          }
+
+          EXISTING=$(curl -s -X GET \
+            "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/cfd_tunnel?name=${TUNNEL_NAME}&is_deleted=false" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json")
+          check_success "$EXISTING" "list tunnels"
+
+          TUNNEL_ID=$(echo "$EXISTING" | jq -r '.result[0].id // empty')
+
+          if [ -z "$TUNNEL_ID" ]; then
+            echo "No existing tunnel found, creating a new one..."
+            CREATE=$(curl -s -X POST \
+              "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/cfd_tunnel" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "{\"name\":\"${TUNNEL_NAME}\",\"config_src\":\"cloudflare\"}")
+            check_success "$CREATE" "create tunnel"
+            TUNNEL_ID=$(echo "$CREATE" | jq -r '.result.id')
+            echo "Created tunnel: $TUNNEL_ID"
+          else
+            echo "Reusing existing tunnel: $TUNNEL_ID"
+          fi
+
+          if [ -z "$TUNNEL_ID" ] || [ "$TUNNEL_ID" = "null" ]; then
+            echo "::error::TUNNEL_ID خالی ماند، ادامه معنی ندارد."
+            exit 1
+          fi
+
+          echo "tunnel_id=$TUNNEL_ID" >> "$GITHUB_OUTPUT"
+
+          # گرفتن Token اتصال برای این تونل
+          TOKEN_RESP=$(curl -s -X GET \
+            "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${TUNNEL_ID}/token" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}")
+          check_success "$TOKEN_RESP" "get connector token"
+
+          CONNECTOR_TOKEN=$(echo "$TOKEN_RESP" | jq -r '.result')
+          if [ -z "$CONNECTOR_TOKEN" ] || [ "$CONNECTOR_TOKEN" = "null" ]; then
+            echo "::error::Connector token خالی برگشت."
+            exit 1
+          fi
+          echo "::add-mask::$CONNECTOR_TOKEN"
+          echo "connector_token=$CONNECTOR_TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Configure Tunnel ingress (route hostnames -> localhost services)
+        run: |
+          # ingress دوم برای VLESS+WS فقط وقتی اضافه می‌شود که TUNNEL_HOSTNAME_VPN ست شده باشد.
+          # اگر ست نباشد، دقیقاً همان رفتار قبلی (فقط پنل) حفظ می‌شود.
+          VPN_RULE=""
+          if [ -n "${TUNNEL_HOSTNAME_VPN}" ]; then
+            VPN_RULE="{ \"hostname\": \"${TUNNEL_HOSTNAME_VPN}\", \"service\": \"http://localhost:${XRAY_WS_PORT}\" },"
+            echo "VPN ingress will be added: ${TUNNEL_HOSTNAME_VPN} -> localhost:${XRAY_WS_PORT}"
+          else
+            echo "TUNNEL_HOSTNAME_VPN تنظیم نشده — فقط ingress پنل اعمال می‌شود."
+          fi
+
+          # ingress سوم برای SSH فقط وقتی اضافه می‌شود که TUNNEL_HOSTNAME_SSH ست شده باشد.
+          # نکته مهم: خودِ این ingress به‌تنهایی کافی نیست — بر خلاف HTTP ingress،
+          # هیچ کلاینت SSH معمولی نمی‌تواند مستقیم به این hostname وصل شود.
+          # اتصال واقعی فقط از طریق Cloudflare Access + cloudflared در سمت کلاینت ممکن است
+          # (جزئیات در step "Keep runner alive" چاپ می‌شود).
+          SSH_RULE=""
+          if [ -n "${TUNNEL_HOSTNAME_SSH}" ]; then
+            SSH_RULE="{ \"hostname\": \"${TUNNEL_HOSTNAME_SSH}\", \"service\": \"ssh://localhost:22\" },"
+            echo "SSH ingress will be added: ${TUNNEL_HOSTNAME_SSH} -> ssh://localhost:22"
+            echo "توجه: این ingress به‌تنهایی کافی نیست؛ اتصال کلاینت نیاز به Cloudflare Access + cloudflared client-side دارد."
+          else
+            echo "TUNNEL_HOSTNAME_SSH تنظیم نشده — SSH از طریق Tunnel اضافه نمی‌شود."
+          fi
+
+          RESP=$(curl -s -X PUT \
+            "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${{ steps.tunnel.outputs.tunnel_id }}/configurations" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "{
+              \"config\": {
+                \"ingress\": [
+                  { \"hostname\": \"${TUNNEL_HOSTNAME}\", \"service\": \"http://localhost:${{ steps.panel.outputs.port }}\" },
+                  ${VPN_RULE}
+                  ${SSH_RULE}
+                  { \"service\": \"http_status:404\" }
+                ]
+              }
+            }")
+          OK=$(echo "$RESP" | jq -r '.success')
+          if [ "$OK" != "true" ]; then
+            echo "::error::تنظیم ingress شکست خورد."
+            echo "$RESP" | jq -r '.errors'
+            exit 1
+          fi
+          echo "Ingress configured: ${TUNNEL_HOSTNAME} -> localhost:${{ steps.panel.outputs.port }}"
+          if [ -n "${TUNNEL_HOSTNAME_VPN}" ]; then
+            echo "Ingress configured: ${TUNNEL_HOSTNAME_VPN} -> localhost:${XRAY_WS_PORT}"
+          fi
+          if [ -n "${TUNNEL_HOSTNAME_SSH}" ]; then
+            echo "Ingress configured: ${TUNNEL_HOSTNAME_SSH} -> ssh://localhost:22"
+          fi
+
+      - name: Create/Update DNS record for tunnel hostname
+        run: |
+          TUNNEL_ID="${{ steps.tunnel.outputs.tunnel_id }}"
+          TARGET="${TUNNEL_ID}.cfargotunnel.com"
+
+          EXISTING_DNS=$(curl -s -X GET \
+            "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=${TUNNEL_HOSTNAME}" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}")
+          OK=$(echo "$EXISTING_DNS" | jq -r '.success')
+          if [ "$OK" != "true" ]; then
+            echo "::error::خواندن رکورد DNS شکست خورد."
+            echo "$EXISTING_DNS" | jq -r '.errors'
+            exit 1
+          fi
+
+          RECORD_ID=$(echo "$EXISTING_DNS" | jq -r '.result[0].id // empty')
+
+          if [ -z "$RECORD_ID" ]; then
+            RESP=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "{\"type\":\"CNAME\",\"name\":\"${TUNNEL_HOSTNAME}\",\"content\":\"${TARGET}\",\"proxied\":true}")
+            ACTION="create"
+          else
+            RESP=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${RECORD_ID}" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "{\"type\":\"CNAME\",\"name\":\"${TUNNEL_HOSTNAME}\",\"content\":\"${TARGET}\",\"proxied\":true}")
+            ACTION="update"
+          fi
+
+          OK=$(echo "$RESP" | jq -r '.success')
+          if [ "$OK" != "true" ]; then
+            echo "::error::$ACTION رکورد DNS شکست خورد."
+            echo "$RESP" | jq -r '.errors'
+            exit 1
+          fi
+          echo "DNS record $ACTION موفق بود -> $TARGET"
+
+      - name: Create/Update DNS record for VPN (VLESS) hostname
+        if: env.TUNNEL_HOSTNAME_VPN != ''
+        run: |
+          TUNNEL_ID="${{ steps.tunnel.outputs.tunnel_id }}"
+          TARGET="${TUNNEL_ID}.cfargotunnel.com"
+
+          EXISTING_DNS=$(curl -s -X GET \
+            "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=${TUNNEL_HOSTNAME_VPN}" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}")
+          OK=$(echo "$EXISTING_DNS" | jq -r '.success')
+          if [ "$OK" != "true" ]; then
+            echo "::error::خواندن رکورد DNS (VPN) شکست خورد."
+            echo "$EXISTING_DNS" | jq -r '.errors'
+            exit 1
+          fi
+
+          RECORD_ID=$(echo "$EXISTING_DNS" | jq -r '.result[0].id // empty')
+
+          if [ -z "$RECORD_ID" ]; then
+            RESP=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "{\"type\":\"CNAME\",\"name\":\"${TUNNEL_HOSTNAME_VPN}\",\"content\":\"${TARGET}\",\"proxied\":true}")
+            ACTION="create"
+          else
+            RESP=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${RECORD_ID}" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "{\"type\":\"CNAME\",\"name\":\"${TUNNEL_HOSTNAME_VPN}\",\"content\":\"${TARGET}\",\"proxied\":true}")
+            ACTION="update"
+          fi
+
+          OK=$(echo "$RESP" | jq -r '.success')
+          if [ "$OK" != "true" ]; then
+            echo "::error::$ACTION رکورد DNS (VPN) شکست خورد."
+            echo "$RESP" | jq -r '.errors'
+            exit 1
+          fi
+          echo "DNS record (VPN) $ACTION موفق بود -> $TARGET"
+
+      - name: Create/Update DNS record for SSH hostname
+        if: env.TUNNEL_HOSTNAME_SSH != ''
+        run: |
+          TUNNEL_ID="${{ steps.tunnel.outputs.tunnel_id }}"
+          TARGET="${TUNNEL_ID}.cfargotunnel.com"
+
+          EXISTING_DNS=$(curl -s -X GET \
+            "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=${TUNNEL_HOSTNAME_SSH}" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}")
+          OK=$(echo "$EXISTING_DNS" | jq -r '.success')
+          if [ "$OK" != "true" ]; then
+            echo "::error::خواندن رکورد DNS (SSH) شکست خورد."
+            echo "$EXISTING_DNS" | jq -r '.errors'
+            exit 1
+          fi
+
+          RECORD_ID=$(echo "$EXISTING_DNS" | jq -r '.result[0].id // empty')
+
+          if [ -z "$RECORD_ID" ]; then
+            RESP=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "{\"type\":\"CNAME\",\"name\":\"${TUNNEL_HOSTNAME_SSH}\",\"content\":\"${TARGET}\",\"proxied\":true}")
+            ACTION="create"
+          else
+            RESP=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${RECORD_ID}" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              --data "{\"type\":\"CNAME\",\"name\":\"${TUNNEL_HOSTNAME_SSH}\",\"content\":\"${TARGET}\",\"proxied\":true}")
+            ACTION="update"
+          fi
+
+          OK=$(echo "$RESP" | jq -r '.success')
+          if [ "$OK" != "true" ]; then
+            echo "::error::$ACTION رکورد DNS (SSH) شکست خورد."
+            echo "$RESP" | jq -r '.errors'
+            exit 1
+          fi
+          echo "DNS record (SSH) $ACTION موفق بود -> $TARGET"
+
+      - name: Test local panel before starting tunnel
+        run: |
+          PORT="${{ steps.panel.outputs.port }}"
+          echo "Testing http://127.0.0.1:${PORT} ..."
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "http://127.0.0.1:${PORT}" || echo "000")
+          echo "Local panel responded with HTTP ${CODE}"
+          if [ "$CODE" = "000" ]; then
+            echo "::error::پنل روی localhost:${PORT} اصلاً پاسخ نداد (connection refused/timeout). مشکل از Sanaei است، نه Tunnel."
+            sudo systemctl status x-ui --no-pager || true
+            exit 1
+          fi
+
+      - name: Run cloudflared connector
+        run: |
+          echo "Panel will be reachable at: https://${TUNNEL_HOSTNAME}"
+
+          nohup cloudflared tunnel run \
+            --token "${{ steps.tunnel.outputs.connector_token }}" \
+            > /tmp/cloudflared.log 2>&1 &
+          disown
+
+          echo "Waiting for tunnel connection..."
+          CONNECTED=0
+          for i in $(seq 1 30); do
+            if grep -q "Registered tunnel connection" /tmp/cloudflared.log; then
+              echo "Tunnel connected successfully after ${i}0s (approx)."
+              CONNECTED=1
+              break
+            fi
+            sleep 2
+          done
+
+          echo "--- cloudflared log ---"
+          cat /tmp/cloudflared.log
+          echo "-----------------------"
+
+          if [ "$CONNECTED" != "1" ]; then
+            echo "::error::Tunnel did not establish a connection within 60 seconds. مراحل بعدی متوقف شدند."
+            exit 1
+          fi
+
+          # تست واقعی از طریق hostname عمومی (نه فقط localhost)
+          echo "Testing https://${TUNNEL_HOSTNAME} from the runner itself..."
+          for i in $(seq 1 10); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "https://${TUNNEL_HOSTNAME}" || echo "000")
+            if [ "$CODE" != "000" ]; then
+              echo "Public hostname responded with HTTP ${CODE}"
+              break
+            fi
+            echo "هنوز DNS/routing آماده نیست (تلاش ${i}/10)، صبر..."
+            sleep 3
+          done
+
+      - name: Diagnostics — full inbound/xray/firewall check
+        run: |
+          echo "════════════════════════════════════════════"
+          echo " Diagnostics run at $(date -u +%FT%TZ)"
+          echo "════════════════════════════════════════════"
+
+          echo "--- 1) x-ui service status ---"
+          sudo systemctl status x-ui --no-pager || echo "  (x-ui service not found/failed)"
+
+          echo ""
+          echo "--- 2) processes (xray/x-ui/cloudflared) ---"
+          ps aux | grep -E "xray|x-ui|cloudflared" | grep -v grep || echo "  (هیچ‌کدام پیدا نشد)"
+
+          echo ""
+          echo "--- 3) تمام پورت‌های در حال listen ---"
+          sudo ss -lntp || echo "  (ss در دسترس نیست)"
+
+          echo ""
+          echo "--- 4) پورت پنل (${{ steps.panel.outputs.port }}) ---"
+          sudo ss -lntp | grep ":${{ steps.panel.outputs.port }} " || echo "  ⚠ چیزی روی پورت پنل listen نیست"
+
+          echo ""
+          echo "--- 5) پورت VLESS/WS (${XRAY_WS_PORT}) ---"
+          if sudo ss -lntp | grep -q ":${XRAY_WS_PORT} "; then
+            sudo ss -lntp | grep ":${XRAY_WS_PORT} "
+            echo "  ✓ چیزی روی پورت ${XRAY_WS_PORT} listen است"
+          else
+            echo "  ⚠ هنوز چیزی روی پورت ${XRAY_WS_PORT} listen نیست — یعنی یا Inbound هنوز در پنل ساخته نشده، یا ساخته شده ولی Xray reload نشده."
+          fi
+
+          echo ""
+          echo "--- 6) تست WS واقعی روی 127.0.0.1:${XRAY_WS_PORT} (با هدرهای Upgrade) ---"
+          curl -i --max-time 5 \
+            -H "Connection: Upgrade" \
+            -H "Upgrade: websocket" \
+            "http://127.0.0.1:${XRAY_WS_PORT}/vless" 2>&1 | head -n 15 \
+            || echo "  ⚠ connection refused/timeout — سرویسی روی این پورت نیست"
+          echo "  (اگر هر پاسخ HTTPی گرفتی — even 400/404 — یعنی چیزی زنده است؛ فقط connection refused واقعاً بد است)"
+
+          echo ""
+          echo "--- 7) لیست Inboundهای ذخیره‌شده در دیتابیس x-ui ---"
+          if command -v sqlite3 >/dev/null 2>&1 && [ -f /etc/x-ui/x-ui.db ]; then
+            sudo sqlite3 /etc/x-ui/x-ui.db \
+              "SELECT id, remark, port, protocol, enable, listen FROM inbounds;" 2>&1 \
+              || echo "  (خواندن جدول inbounds شکست خورد — شاید نام ستون‌ها فرق دارد)"
+          else
+            echo "  (sqlite3 نصب نیست یا فایل دیتابیس پیدا نشد)"
+          fi
+
+          echo ""
+          echo "--- 8) وضعیت فایروال (فقط برای اطلاع — طبق audit قبلی، مسیر واقعی از Tunnel است نه فایروال) ---"
+          sudo ufw status verbose 2>/dev/null || echo "  (ufw نصب/فعال نیست)"
+
+          echo ""
+          echo "--- 9) وضعیت cloudflared و اتصال‌های تونل ---"
+          pgrep -af cloudflared || echo "  ⚠ پردازش cloudflared در حال اجرا نیست!"
+          tail -n 20 /tmp/cloudflared.log 2>/dev/null || echo "  (لاگ cloudflared پیدا نشد)"
+
+          echo ""
+          echo "--- 10) تست از طریق hostname عمومی VPN با -Ik (اگر تنظیم شده) ---"
+          if [ -n "${TUNNEL_HOSTNAME_VPN}" ]; then
+            curl -Ik --max-time 10 "https://${TUNNEL_HOSTNAME_VPN}" 2>&1 | head -n 10 \
+              || echo "  ⚠ هیچ پاسخی از https://${TUNNEL_HOSTNAME_VPN} نیامد"
+            echo "  (انتظار: هر status لاینی غیر از timeout — مثلاً HTTP/2 400 یا 404 — یعنی مسیر تا Tunnel سالم است)"
+          else
+            echo "  (TUNNEL_HOSTNAME_VPN تنظیم نشده)"
+          fi
+
+          echo ""
+          echo "--- 11) تست از طریق hostname عمومی SSH با -Ik (اگر تنظیم شده) ---"
+          if [ -n "${TUNNEL_HOSTNAME_SSH}" ]; then
+            curl -Ik --max-time 10 "https://${TUNNEL_HOSTNAME_SSH}" 2>&1 | head -n 10 \
+              || echo "  ⚠ هیچ پاسخی از https://${TUNNEL_HOSTNAME_SSH} نیامد"
+            echo "  (این فقط تأیید می‌کند hostname در Tunnel ثبت شده؛ SSH واقعی نیاز به cloudflared access دارد، نه curl)"
+          else
+            echo "  (TUNNEL_HOSTNAME_SSH تنظیم نشده)"
+          fi
+
+          echo "════════════════════════════════════════════"
+          echo " پایان Diagnostics"
+          echo "════════════════════════════════════════════"
+
+      - name: Keep runner alive
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          GH_REF: ${{ github.ref_name }}
+        run: |
+          echo "Panel URL: https://${TUNNEL_HOSTNAME}"
+          if [ -n "${TUNNEL_HOSTNAME_VPN}" ]; then
+            echo "VPN (VLESS+WS) hostname: ${TUNNEL_HOSTNAME_VPN} -> localhost:${XRAY_WS_PORT}"
+            echo "کانفیگ کلاینت باید از پورت 443 با type=ws و security=tls استفاده کند، نه پورت داخلی ${XRAY_WS_PORT}."
+          fi
+          echo "SSH root password set from ROOT_PASSWORD secret (not printed here)."
+          if [ -n "${TUNNEL_HOSTNAME_SSH}" ]; then
+            echo "SSH hostname: ${TUNNEL_HOSTNAME_SSH} -> ssh://localhost:22 (از طریق Tunnel)"
+            echo "توجه: اتصال مستقیم به IP:22 هیچ‌وقت کار نمی‌کند (فایروال Azure ورودی را رد می‌کند)."
+            echo "برای وصل شدن از کلاینتی مثل Termux باید از cloudflared access ssh استفاده کنی، نه ssh مستقیم به IP."
+            echo "(این ingress به‌تنهایی کافی نیست؛ Cloudflare Access باید جدا برای این hostname تنظیم شود.)"
+          else
+            echo "توجه: SSH فعلاً از این مسیر عمومی نشده — این تونل فقط پنل HTTP (و در صورت تنظیم، VPN/SSH hostname) را expose می‌کند."
+          fi
+
+          # ── Handoff: قبل از رسیدن به مرز مهلت Job، یک اجرای جدید workflow_dispatch کن
+          # تا وقتی این Runner می‌میرد، یک Runner دیگر با تونل تازه جایگزین آن شده باشد.
+          # HANDOFF_MARGIN_MINUTES و JOB_BUDGET_MINUTES از اول تعریف شده بودند ولی
+          # تا الان هیچ‌جا استفاده نمی‌شدند (TODO قدیمی) — این باعث می‌شد بعد از ۳۴۰
+          # دقیقه، پنل/Tunnel بدون جایگزین از کار بیفتد.
+          HANDOFF_AT=$(( (JOB_BUDGET_MINUTES - HANDOFF_MARGIN_MINUTES) * 60 ))
+          TOTAL_ALIVE=$(( JOB_BUDGET_MINUTES * 60 ))
+          echo ""
+          echo "شروع حلقه‌ی نگه‌داری + دیاگنوستیک دوره‌ای (هر ۶۰ ثانیه)."
+          echo "Handoff (اجرای جایگزین) در حدود دقیقه‌ی ${HANDOFF_AT}s / کل مهلت زنده‌ماندن ${TOTAL_ALIVE}s است."
+
+          DISPATCHED=0
+          END=$(( SECONDS + TOTAL_ALIVE ))
+          while [ "$SECONDS" -lt "$END" ]; do
+            echo ""
+            echo "─── دیاگنوستیک سریع در $(date -u +%FT%TZ) (elapsed=${SECONDS}s) ───"
+
+            if sudo ss -lntp 2>/dev/null | grep -q ":${XRAY_WS_PORT} "; then
+              echo "  ✓ پورت ${XRAY_WS_PORT} (VLESS/WS) در حال listen است"
+            else
+              echo "  ⚠ پورت ${XRAY_WS_PORT} هنوز listen نیست (Inbound ساخته نشده یا Xray reload نشده)"
+            fi
+
+            if pgrep -x xray >/dev/null 2>&1; then
+              echo "  ✓ پردازش xray در حال اجراست"
+            else
+              echo "  ⚠ پردازش xray پیدا نشد"
+            fi
+
+            if pgrep -x cloudflared >/dev/null 2>&1; then
+              echo "  ✓ پردازش cloudflared در حال اجراست"
+            else
+              echo "  ⚠ پردازش cloudflared پیدا نشد — Tunnel قطع شده!"
+            fi
+
+            if [ "$DISPATCHED" -eq 0 ] && [ "$SECONDS" -ge "$HANDOFF_AT" ]; then
+              echo "  ⏳ به مرز handoff رسیدیم — تلاش برای trigger کردن اجرای بعدی workflow..."
+              if [ -z "$GH_TOKEN" ]; then
+                echo "  ::warning::secrets.GITHUB_TOKEN در دسترس نیست؛ handoff خودکار ممکن نیست. باید دستی workflow را دوباره اجرا کنی."
+              else
+                HTTP_CODE=$(curl -s -o /tmp/dispatch_resp.json -w "%{http_code}" -X POST \
+                  -H "Authorization: Bearer ${GH_TOKEN}" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/${GH_REPO}/actions/workflows/${WORKFLOW_FILE}/dispatches" \
+                  -d "{\"ref\":\"${GH_REF}\"}")
+                if [ "$HTTP_CODE" = "204" ]; then
+                  echo "  ✓ اجرای جایگزین با موفقیت trigger شد (HTTP 204)."
+                else
+                  echo "  ⚠ trigger کردن اجرای جایگزین شکست خورد (HTTP ${HTTP_CODE})."
+                  cat /tmp/dispatch_resp.json 2>/dev/null || true
+                  echo "  توجه: توکن پیش‌فرض GITHUB_TOKEN معمولاً اجازه‌ی workflow_dispatch روی همان workflow را ندارد؛"
+                  echo "  اگر این خطا تکرار شد، یک Personal Access Token با scope 'workflow' بساز و آن را به‌جای"
+                  echo "  secrets.GITHUB_TOKEN در این step (به اسم مثلاً HANDOFF_PAT) استفاده کن."
+                fi
+              fi
+              DISPATCHED=1
+            fi
+
+            sleep 60
+          done
+
+          echo ""
+          echo "مهلت این Runner تمام شد. اگر handoff موفق بود، یک Runner جدید باید همین الان یا کمی قبل‌تر شروع شده باشد."
